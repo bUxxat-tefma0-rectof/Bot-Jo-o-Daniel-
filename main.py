@@ -188,3 +188,187 @@ Faça uma recarga e tente novamente.
 🆔 *Pedido:* #{order_id}
 
 *Credenciais:*
+
+♻️ *Garantia:* 30 dias
+📞 *Suporte:* {SUPPORT_USERNAME}
+    """
+    
+    keyboard = [
+        [InlineKeyboardButton("🛒 Comprar Novamente", callback_data="premium_products")],
+        [InlineKeyboardButton("↩️ Voltar ao Início", callback_data="back_to_main")]
+    ]
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
+
+# Handler para recarga
+async def recharge_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    user = db.get_user(query.from_user.id)
+    
+    text = f"""
+💼 *ID da Carteira:* `{user[0]}`
+💵 *Saldo Disponível:* R${user[3]:.2f}
+
+💡 *Selecione uma opção para recarregar:*
+    """
+    
+    keyboard = [
+        [InlineKeyboardButton("💳 PIX AUTOMÁTICO", callback_data="pix_payment")],
+        [InlineKeyboardButton("↩️ Voltar", callback_data="back_to_main")]
+    ]
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
+
+# Handler para pagamento PIX
+async def pix_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    text = f"""
+ℹ️ *Informe o valor que deseja recarregar:*
+
+🔻 *Recarga mínima:* R${MIN_DEPOSIT:.2f}
+
+⚠️ *Por favor, envie o valor que deseja recarregar agora.*
+    """
+    
+    await query.edit_message_text(text, parse_mode='Markdown')
+    context.user_data['awaiting_amount'] = True
+
+# Handler para mensagens de texto (valor da recarga)
+async def handle_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get('awaiting_amount'):
+        return
+    
+    try:
+        amount = float(update.message.text.replace(',', '.'))
+        
+        if amount < MIN_DEPOSIT:
+            await update.message.reply_text(f"❌ Valor mínimo é R${MIN_DEPOSIT:.2f}")
+            return
+        
+        user_id = update.effective_user.id
+        
+        # Criar link de pagamento
+        payment_url, session_id = payment_system.create_payment_link(
+            amount, 
+            f"Recarga JOÃO STORE - User {user_id}", 
+            user_id
+        )
+        
+        if payment_url:
+            # Salvar transação
+            db.add_transaction(user_id, amount, session_id)
+            
+            text = f"""
+*Gerando pagamento...*
+
+💰 *Comprar Saldo com PIX Automático:*
+
+⏱️ *Expira em:* 30 minutos
+💵 *Valor:* R${amount:.2f}
+✨ *ID da Recarga:* `{session_id}`
+
+🗞️ *Atenção:* Este código é válido para apenas um único pagamento.
+Se você utilizá-lo mais de uma vez, o saldo adicional será perdido sem direito a reembolso.
+
+💎 *Link de Pagamento:*
+{payment_url}
+
+💡 *Dica:* Clique no link acima para pagar.
+
+🇧🇷 *Após o pagamento, seu saldo será liberado instantaneamente.*
+            """
+            
+            keyboard = [
+                [InlineKeyboardButton("⏰ Verificar Pagamento", callback_data=f"check_payment_{session_id}")],
+                [InlineKeyboardButton("↩️ Voltar", callback_data="recharge")]
+            ]
+            
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await update.message.reply_text(text, reply_markup=reply_markup, parse_mode='Markdown')
+        
+        context.user_data['awaiting_amount'] = False
+        
+    except ValueError:
+        await update.message.reply_text("❌ Por favor, envie apenas números!")
+
+# Handler para verificar pagamento
+async def check_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    session_id = query.data.split('_')[-1]
+    
+    if payment_system.verify_payment(session_id):
+        if db.complete_transaction(session_id):
+            user = db.get_user(query.from_user.id)
+            text = f"✅ *Pagamento confirmado!*\n\nSeu saldo foi atualizado para: R${user[3]:.2f}"
+        else:
+            text = "❌ *Pagamento já processado anteriormente.*"
+    else:
+        text = "⏳ *Pagamento ainda não confirmado.*\n\nTente novamente em alguns instantes."
+    
+    keyboard = [[InlineKeyboardButton("↩️ Voltar", callback_data="recharge")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
+
+# Handler para perfil do usuário
+async def user_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    user = db.get_user(query.from_user.id)
+    
+    text = f"""
+🙋‍♂️ *Meu Perfil*
+
+🔎 *Veja aqui os detalhes da sua conta:*
+
+*-👤 Informações:*
+🆔 *ID da Carteira:* `{user[0]}`
+💰 *Saldo Atual:* R${user[3]:.2f}
+
+*📊 Suas movimentações:*
+—🛒 *Compras Realizadas:* 0
+—💠 *Pix Inseridos:* R$0,00
+—🎁 *Gifts Resgatados:* R$0,00
+    """
+    
+    keyboard = [
+        [InlineKeyboardButton("🛍️ Histórico De Compras", callback_data="purchase_history")],
+        [InlineKeyboardButton("↩️ Voltar", callback_data="back_to_main")]
+    ]
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
+
+# Handler principal
+def main():
+    application = Application.builder().token(BOT_TOKEN).build()
+    
+    # Handlers de comandos
+    application.add_handler(CommandHandler("start", start))
+    
+    # Handlers de callback
+    application.add_handler(CallbackQueryHandler(premium_products, pattern="^premium_products$"))
+    application.add_handler(CallbackQueryHandler(view_product, pattern="^product_"))
+    application.add_handler(CallbackQueryHandler(buy_product, pattern="^buy_"))
+    application.add_handler(CallbackQueryHandler(recharge_menu, pattern="^recharge$"))
+    application.add_handler(CallbackQueryHandler(pix_payment, pattern="^pix_payment$"))
+    application.add_handler(CallbackQueryHandler(check_payment, pattern="^check_payment_"))
+    application.add_handler(CallbackQueryHandler(user_profile, pattern="^profile$"))
+    
+    # Handler para mensagens de texto
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_amount))
+    
+    # Iniciar bot
+    application.run_polling()
+
+if __name__ == '__main__':
+    main()
