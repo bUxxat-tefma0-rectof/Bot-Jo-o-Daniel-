@@ -1,11 +1,10 @@
 import logging
+import os
+import sqlite3
+import stripe
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
-from config import BOT_TOKEN, ADMIN_ID, MIN_DEPOSIT, BOT_USERNAME, SUPPORT_USERNAME, GROUP_URL
-from database import Database
-from payment import PaymentSystem
-import json
-from datetime import datetime
+from config import BOT_TOKEN, ADMIN_ID, MIN_DEPOSIT, BOT_USERNAME, SUPPORT_USERNAME, GROUP_URL, STRIPE_API_KEY
 
 # Configurar logging
 logging.basicConfig(
@@ -13,8 +12,163 @@ logging.basicConfig(
     level=logging.INFO
 )
 
+# Configurar Stripe
+stripe.api_key = STRIPE_API_KEY
+
+class Database:
+    def __init__(self):
+        self.conn = sqlite3.connect('joao_store.db', check_same_thread=False)
+        self.create_tables()
+        self.create_sample_products()
+    
+    def create_tables(self):
+        cursor = self.conn.cursor()
+        
+        # Tabela de usuários
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                balance REAL DEFAULT 0.0,
+                referral_code TEXT,
+                referred_by INTEGER,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # Tabela de produtos
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS products (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                description TEXT,
+                price REAL NOT NULL,
+                stock INTEGER DEFAULT 0,
+                category TEXT DEFAULT 'logins',
+                is_active BOOLEAN DEFAULT TRUE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # Tabela de pedidos
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                product_id INTEGER,
+                price REAL,
+                credentials TEXT,
+                status TEXT DEFAULT 'completed',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # Tabela de transações
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS transactions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                amount REAL,
+                type TEXT,
+                payment_id TEXT,
+                status TEXT DEFAULT 'pending',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        self.conn.commit()
+    
+    def create_sample_products(self):
+        """Criar produtos de exemplo"""
+        cursor = self.conn.cursor()
+        
+        # Verificar se já existem produtos
+        cursor.execute('SELECT COUNT(*) FROM products')
+        if cursor.fetchone()[0] == 0:
+            sample_products = [
+                ("NETFLIX PREMIUM (TELA)", "Acesso premium ao Netflix", 11.00, 50),
+                ("MAX HBO (TELA)", "Acesso ao Max HBO", 3.00, 30),
+                ("PRIME VIDEO (TELA)", "Acesso ao Prime Video", 3.00, 40),
+                ("DISNEY+ (TELA)", "Acesso ao Disney+", 5.00, 35),
+                ("YOUTUBE PREMIUM", "YouTube Premium familiar", 8.00, 25)
+            ]
+            
+            for name, desc, price, stock in sample_products:
+                cursor.execute(
+                    'INSERT INTO products (name, description, price, stock) VALUES (?, ?, ?, ?)',
+                    (name, desc, price, stock)
+                )
+            
+            self.conn.commit()
+    
+    def add_user(self, user_id, username, first_name):
+        cursor = self.conn.cursor()
+        referral_code = f"REF{user_id}"
+        cursor.execute(
+            'INSERT OR IGNORE INTO users (user_id, username, first_name, referral_code) VALUES (?, ?, ?, ?)',
+            (user_id, username, first_name, referral_code)
+        )
+        self.conn.commit()
+    
+    def get_user(self, user_id):
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT * FROM users WHERE user_id = ?', (user_id,))
+        return cursor.fetchone()
+    
+    def update_balance(self, user_id, amount):
+        cursor = self.conn.cursor()
+        cursor.execute('UPDATE users SET balance = balance + ? WHERE user_id = ?', (amount, user_id))
+        self.conn.commit()
+    
+    def get_products(self, category=None):
+        cursor = self.conn.cursor()
+        if category:
+            cursor.execute('SELECT * FROM products WHERE category = ? AND is_active = TRUE', (category,))
+        else:
+            cursor.execute('SELECT * FROM products WHERE is_active = TRUE')
+        return cursor.fetchall()
+    
+    def get_product(self, product_id):
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT * FROM products WHERE id = ?', (product_id,))
+        return cursor.fetchone()
+    
+    def create_order(self, user_id, product_id, credentials):
+        cursor = self.conn.cursor()
+        product = self.get_product(product_id)
+        cursor.execute(
+            'INSERT INTO orders (user_id, product_id, price, credentials) VALUES (?, ?, ?, ?)',
+            (user_id, product_id, product[3], credentials)
+        )
+        # Atualizar estoque
+        cursor.execute('UPDATE products SET stock = stock - 1 WHERE id = ?', (product_id,))
+        self.conn.commit()
+        return cursor.lastrowid
+    
+    def add_transaction(self, user_id, amount, payment_id, type='deposit'):
+        cursor = self.conn.cursor()
+        cursor.execute(
+            'INSERT INTO transactions (user_id, amount, type, payment_id) VALUES (?, ?, ?, ?)',
+            (user_id, amount, type, payment_id)
+        )
+        self.conn.commit()
+        return cursor.lastrowid
+    
+    def complete_transaction(self, payment_id):
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT * FROM transactions WHERE payment_id = ?', (payment_id,))
+        transaction = cursor.fetchone()
+        
+        if transaction and transaction[5] == 'pending':
+            cursor.execute('UPDATE transactions SET status = "completed" WHERE payment_id = ?', (payment_id,))
+            cursor.execute('UPDATE users SET balance = balance + ? WHERE user_id = ?', (transaction[2], transaction[1]))
+            self.conn.commit()
+            return True
+        return False
+
+# Inicializar banco de dados
 db = Database()
-payment_system = PaymentSystem()
 
 # Comando /start
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -23,6 +177,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Adicionar usuário ao banco de dados
     db.add_user(user_id, user.username, user.first_name)
+    user_data = db.get_user(user_id)
+    balance = user_data[3] if user_data else 0.0
     
     # Mensagem de boas-vindas
     welcome_text = f"""
@@ -38,7 +194,7 @@ Ele facilita a busca por diversos produtos e serviços, garantindo que você enc
 
 *ℹ️Seus Dados:*
 🆔 *ID:* `{user_id}`
-💸 *Saldo Atual:* R$0,00
+💸 *Saldo Atual:* R${balance:.2f}
 🪪 *Usuário:* @{user.username if user.username else 'N/A'}
     """
     
@@ -52,7 +208,7 @@ Ele facilita a busca por diversos produtos e serviços, garantindo que você enc
         ],
         [
             InlineKeyboardButton("🎖️ Ranking", callback_data="ranking"),
-            InlineKeyboardButton("👩‍💻 Suporte", url=SUPPORT_USERNAME)
+            InlineKeyboardButton("👩‍💻 Suporte", url=SUPPORT_URL)
         ],
         [
             InlineKeyboardButton("ℹ️ Informações", callback_data="info"),
@@ -62,11 +218,18 @@ Ele facilita a busca por diversos produtos e serviços, garantindo que você enc
     
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    await update.message.reply_text(
-        welcome_text,
-        reply_markup=reply_markup,
-        parse_mode='Markdown'
-    )
+    if update.message:
+        await update.message.reply_text(
+            welcome_text,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+    else:
+        await update.callback_query.edit_message_text(
+            welcome_text,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
 
 # Handler para produtos premium
 async def premium_products(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -124,7 +287,9 @@ async def view_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
 💼 *Saldo Atual:* R${balance:.2f}
 📥 *Estoque Disponível:* {product[4]}
 
-🗒️ *Descrição:* Aviso Importante:
+🗒️ *Descrição:* {product[2]}
+
+*Aviso Importante:*
 O acesso é disponibilizado na hora. Não atendemos ligações nem ouvimos mensagens de áudio; pedimos que aguarde sua vez.
 Informamos que não realizamos reembolsos via Pix, apenas em créditos no bot, correspondendo aos dias restantes até o vencimento.
 Agradecemos pela compreensão e desejamos boas compras!
@@ -174,8 +339,7 @@ Faça uma recarga e tente novamente.
         return
     
     # Processar compra
-    # Aqui você implementaria a lógica para gerar credenciais
-    credentials = "email: teste@exemplo.com\nsenha: 123456"  # Exemplo
+    credentials = f"email: usuario{user[0]}@joaostore.com\nsenha: {user[0]}{product_id}"
     
     order_id = db.create_order(user[0], product_id, credentials)
     db.update_balance(user[0], -product[3])
@@ -188,7 +352,7 @@ Faça uma recarga e tente novamente.
 🆔 *Pedido:* #{order_id}
 
 *Credenciais:*
-
+    
 ♻️ *Garantia:* 30 dias
 📞 *Suporte:* {SUPPORT_USERNAME}
     """
@@ -253,16 +417,31 @@ async def handle_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         user_id = update.effective_user.id
         
-        # Criar link de pagamento
-        payment_url, session_id = payment_system.create_payment_link(
-            amount, 
-            f"Recarga JOÃO STORE - User {user_id}", 
-            user_id
-        )
-        
-        if payment_url:
+        # Criar sessão de checkout do Stripe
+        try:
+            session = stripe.checkout.Session.create(
+                payment_method_types=['card'],
+                line_items=[{
+                    'price_data': {
+                        'currency': 'brl',
+                        'product_data': {
+                            'name': f'Recarga JOÃO STORE - R${amount:.2f}',
+                        },
+                        'unit_amount': int(amount * 100),
+                    },
+                    'quantity': 1,
+                }],
+                mode='payment',
+                success_url=f'https://t.me/{BOT_USERNAME.replace("@", "")}?start=payment_success',
+                cancel_url=f'https://t.me/{BOT_USERNAME.replace("@", "")}?start=payment_cancel',
+                metadata={
+                    'user_id': user_id,
+                    'amount': amount
+                }
+            )
+            
             # Salvar transação
-            db.add_transaction(user_id, amount, session_id)
+            db.add_transaction(user_id, amount, session.id)
             
             text = f"""
 *Gerando pagamento...*
@@ -271,13 +450,13 @@ async def handle_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 ⏱️ *Expira em:* 30 minutos
 💵 *Valor:* R${amount:.2f}
-✨ *ID da Recarga:* `{session_id}`
+✨ *ID da Recarga:* `{session.id}`
 
 🗞️ *Atenção:* Este código é válido para apenas um único pagamento.
 Se você utilizá-lo mais de uma vez, o saldo adicional será perdido sem direito a reembolso.
 
 💎 *Link de Pagamento:*
-{payment_url}
+{session.url}
 
 💡 *Dica:* Clique no link acima para pagar.
 
@@ -285,12 +464,16 @@ Se você utilizá-lo mais de uma vez, o saldo adicional será perdido sem direit
             """
             
             keyboard = [
-                [InlineKeyboardButton("⏰ Verificar Pagamento", callback_data=f"check_payment_{session_id}")],
+                [InlineKeyboardButton("⏰ Verificar Pagamento", callback_data=f"check_payment_{session.id}")],
                 [InlineKeyboardButton("↩️ Voltar", callback_data="recharge")]
             ]
             
             reply_markup = InlineKeyboardMarkup(keyboard)
             await update.message.reply_text(text, reply_markup=reply_markup, parse_mode='Markdown')
+        
+        except Exception as e:
+            await update.message.reply_text("❌ Erro ao processar pagamento. Tente novamente.")
+            print(f"Stripe error: {e}")
         
         context.user_data['awaiting_amount'] = False
         
@@ -304,14 +487,20 @@ async def check_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     session_id = query.data.split('_')[-1]
     
-    if payment_system.verify_payment(session_id):
-        if db.complete_transaction(session_id):
-            user = db.get_user(query.from_user.id)
-            text = f"✅ *Pagamento confirmado!*\n\nSeu saldo foi atualizado para: R${user[3]:.2f}"
+    try:
+        session = stripe.checkout.Session.retrieve(session_id)
+        
+        if session.payment_status == 'paid':
+            if db.complete_transaction(session_id):
+                user = db.get_user(query.from_user.id)
+                text = f"✅ *Pagamento confirmado!*\n\nSeu saldo foi atualizado para: R${user[3]:.2f}"
+            else:
+                text = "❌ *Pagamento já processado anteriormente.*"
         else:
-            text = "❌ *Pagamento já processado anteriormente.*"
-    else:
-        text = "⏳ *Pagamento ainda não confirmado.*\n\nTente novamente em alguns instantes."
+            text = "⏳ *Pagamento ainda não confirmado.*\n\nTente novamente em alguns instantes."
+    except Exception as e:
+        text = "❌ *Erro ao verificar pagamento.*"
+        print(f"Payment check error: {e}")
     
     keyboard = [[InlineKeyboardButton("↩️ Voltar", callback_data="recharge")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -348,14 +537,57 @@ async def user_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_markup = InlineKeyboardMarkup(keyboard)
     await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
 
+# Handler para voltar ao menu principal
+async def back_to_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await start(update, context)
+
+# Handler para informações
+async def bot_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    text = f"""
+ℹ️ *SOFTWARE INFO:*
+🤖 *BOT:* {BOT_USERNAME}
+🤖 *VERSION:* 2.0
+
+🛠️ *DEVELOPER INFO:*
+O Desenvolvedor não possui responsabilidade alguma sobre este Bot e nem sobre o adm do mesmo, caso entre em contato para reclamar sobre material ou pedir para chamar o adm deste Bot ou algo do tipo, será bloqueado de imediato... Apenas o chame, caso queira conhecer os Bots disponíveis.
+    """
+    
+    keyboard = [[InlineKeyboardButton("↩️ Voltar", callback_data="back_to_main")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
+
+# Handler para ranking
+async def show_ranking(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    text = """
+🏆 *Ranking dos serviços mais vendidos*
+
+1️⃣ *Em desenvolvimento...*
+    """
+    
+    keyboard = [[InlineKeyboardButton("↩️ Voltar", callback_data="back_to_main")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
+
 # Handler principal
 def main():
+    # Criar aplicação
     application = Application.builder().token(BOT_TOKEN).build()
     
     # Handlers de comandos
     application.add_handler(CommandHandler("start", start))
     
     # Handlers de callback
+    application.add_handler(CallbackQueryHandler(start, pattern="^back_to_main$"))
     application.add_handler(CallbackQueryHandler(premium_products, pattern="^premium_products$"))
     application.add_handler(CallbackQueryHandler(view_product, pattern="^product_"))
     application.add_handler(CallbackQueryHandler(buy_product, pattern="^buy_"))
@@ -363,11 +595,14 @@ def main():
     application.add_handler(CallbackQueryHandler(pix_payment, pattern="^pix_payment$"))
     application.add_handler(CallbackQueryHandler(check_payment, pattern="^check_payment_"))
     application.add_handler(CallbackQueryHandler(user_profile, pattern="^profile$"))
+    application.add_handler(CallbackQueryHandler(bot_info, pattern="^info$"))
+    application.add_handler(CallbackQueryHandler(show_ranking, pattern="^ranking$"))
     
     # Handler para mensagens de texto
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_amount))
     
     # Iniciar bot
+    print("🤖 Bot JOÃO STORE iniciado!")
     application.run_polling()
 
 if __name__ == '__main__':
